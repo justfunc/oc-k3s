@@ -1,0 +1,221 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: v2ray-demoside-config
+data:
+  nginx.conf: |-
+    user  nginx;
+    worker_processes  auto;
+
+    error_log  /var/log/nginx/error.log notice;
+    pid        /var/run/nginx.pid;
+
+
+    events {
+        worker_connections  1024;
+    }
+
+
+    http {
+        include       /etc/nginx/mime.types;
+        default_type  application/octet-stream;
+
+        log_format  main  '$remote_addr - $remote_user [$time_local] "$request" '
+                          '$status $body_bytes_sent "$http_referer" '
+                          '"$http_user_agent" "$http_x_forwarded_for"';
+
+        access_log  /var/log/nginx/access.log  main;
+
+        sendfile        on;
+        #tcp_nopush     on;
+
+        keepalive_timeout  65;
+
+        #gzip  on;
+
+        server {
+            listen       80;
+            listen  [::]:80;
+            server_name  <your_domain> localhost;
+
+            #access_log  /var/log/nginx/host.access.log  main;
+
+            location / {
+                root   /usr/share/nginx/html;
+                index  index.html index.htm;
+            }
+
+            error_page   500 502 503 504  /50x.html;
+            location = /50x.html {
+                root   /usr/share/nginx/html;
+            }
+
+            location /cnm {
+              if ($http_upgrade != "websocket") {
+                  return 404;
+              }
+              proxy_redirect off;
+              proxy_pass http://localhost:10000; # 假设WebSocket监听在环回地址的10000端口上
+              proxy_http_version 1.1;
+              proxy_set_header Upgrade $http_upgrade;
+              proxy_set_header Connection "upgrade";
+              proxy_set_header Host $host;
+              # Show real IP in v2ray access.log
+              proxy_set_header X-Real-IP $remote_addr;
+              proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+            }
+        }
+    }
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: v2ray-demo-config
+data:
+  config.json: |-
+    {
+      "log": {
+        "loglevel": "warn",
+        "access": "/var/log/v2ray/access.log",
+        "error": "/var/log/v2ray/error.log"
+      },
+      "inbounds": [
+        {
+          "port": 10000,
+          "listen":"0.0.0.0",
+          "protocol": "vmess",
+          "settings": {
+            "clients": [
+              {
+                "id": "65bb1d64-5f35-42c2-869b-509xxx8de1c8",
+                "alterId": 0
+              }
+            ]
+          },
+          "streamSettings": {
+            "network": "ws",
+            "wsSettings": {
+            "path": "/cnm"
+            }
+          }
+        }
+      ],
+      "outbounds": [
+        {
+          "protocol": "freedom",
+          "settings": {}
+        }
+      ]
+    }
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: demoside-nginx
+  labels:
+    app: demoside-nginx
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: demoside-nginx
+  template:
+    metadata:
+      labels:
+        app: demoside-nginx
+    spec:
+      containers:
+        - name: nginx
+          image: nginx
+          ports:
+            - containerPort: 80
+          volumeMounts:
+            - name: html-volume
+              mountPath: /usr/share/nginx/html
+            - name: nginx-v2ray-config
+              mountPath: /etc/nginx/nginx.conf
+              subPath: nginx.conf
+        - name: v2ray
+          image: v2fly/v2fly-core
+          env:
+            - name: V2RAY_VMESS_AEAD_FORCED
+              value: "false"
+            - name: TZ
+              value: "Asia/Shanghai"
+          ports:
+            - containerPort: 10000
+          volumeMounts:
+            - name: v2ray-config
+              mountPath: /etc/v2ray
+      volumes:
+        - name: html-volume
+          persistentVolumeClaim:
+            claimName: nfs-pvc1
+        - name: v2ray-config
+          configMap:
+            name: v2ray-demo-config
+        - name: nginx-v2ray-config
+          configMap:
+            name: v2ray-demoside-config
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: demoside-nginx-service
+spec:
+  selector:
+    app: demoside-nginx
+  ports:
+    - protocol: TCP
+      port: 80
+---
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: demoside-traefik-ingress
+  namespace: default
+  annotations:
+    cert-manager.io/cluster-issuer: letsencrypt-prod
+    kubernetes.io/ingress.class: traefik
+    traefik.ingress.kubernetes.io/router.entrypoints: websecure
+    traefik.ingress.kubernetes.io/router.tls: "true"
+    traefik.ingress.kubernetes.io/service.passhostheader: "true"
+spec:
+  rules:
+    - host: <your_domain>
+      http:
+        paths:
+          - backend:
+              service:
+                name: demoside-nginx-service
+                port:
+                  number: 80
+            path: /
+            pathType: Prefix
+  tls:
+    - hosts:
+        - <your_domain>
+      secretName: <your_domain>-tls
+---
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: demoside-redirect
+  namespace: default
+  annotations:
+    kubernetes.io/ingress.class: traefik
+    traefik.ingress.kubernetes.io/router.entrypoints: web
+    traefik.ingress.kubernetes.io/router.middlewares: default-redirect@kubernetescrd
+    traefik.ingress.kubernetes.io/service.passhostheader: "true"
+spec:
+  rules:
+    - host: <your_domain>
+      http:
+        paths:
+          - backend:
+              service:
+                name: demoside-nginx-service
+                port:
+                  number: 80
+            path: /
+            pathType: Prefix
